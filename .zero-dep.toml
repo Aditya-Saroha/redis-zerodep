@@ -1,2 +1,2 @@
 track = "D"
-pitch = "A dependency-free in-memory key-value store with strings, TTLs, sorted sets, and a custom binary protocol."
+pitch = "A high-concurrency, persistent in-memory key-value database built entirely from scratch in C++17 using epoll, incremental rehashing, and POSIX primitives with zero dependencies."

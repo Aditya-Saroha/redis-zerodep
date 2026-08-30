@@ -2,7 +2,7 @@
 // Build: g++ -O2 -std=gnu++17 -Wall -Wextra -pthread -DBUILD_TEST \
 //            -o test_skiplist tests/test_skiplist.cpp
 #define BUILD_TEST
-#include "../src/redis.cpp"
+#include "../src/skiplist.hpp"
 #include "test_common.h"
 
 TEST(insert_keeps_score_order) {

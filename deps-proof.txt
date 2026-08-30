@@ -1,33 +1,15 @@
-redis-zerodep dependency proof
-==============================
+build/redis-server
+	linux-vdso.so.1 (0x00007ffe7dbae000)
+	libstdc++.so.6 => /usr/lib/x86_64-linux-gnu/libstdc++.so.6 (0x000074dcb7000000)
+	libgcc_s.so.1 => /usr/lib/x86_64-linux-gnu/libgcc_s.so.1 (0x000074dcb741c000)
+	libc.so.6 => /usr/lib/x86_64-linux-gnu/libc.so.6 (0x000074dcb6c00000)
+	libm.so.6 => /usr/lib/x86_64-linux-gnu/libm.so.6 (0x000074dcb72f6000)
+	/lib64/ld-linux-x86-64.so.2 (0x000074dcb746c000)
 
-Runtime dependency policy: C++ standard library, libc, POSIX sockets,
-polling, time, and pthreads only. No third-party runtime dependencies.
-
-No package manifest or vendored third-party source is present.
-
-Build commands:
-
-g++ -std=gnu++14 -O2 -Wall -Wextra -pthread src/server.cpp src/avl.cpp src/hashtable.cpp src/heap.cpp src/thread_pool.cpp src/zset.cpp -o build/server
-g++ -std=gnu++14 -O2 -Wall -Wextra -pthread src/client.cpp -o build/client
-
-Dependency inspection in WSL/Linux:
-
-$ ldd build/server
-	linux-vdso.so.1
-	libstdc++.so.6 => /usr/lib/x86_64-linux-gnu/libstdc++.so.6
-	libgcc_s.so.1 => /usr/lib/x86_64-linux-gnu/libgcc_s.so.1
-	libc.so.6 => /usr/lib/x86_64-linux-gnu/libc.so.6
-	libm.so.6 => /usr/lib/x86_64-linux-gnu/libm.so.6
-	/lib64/ld-linux-x86-64.so.2
-
-$ ldd build/client
-	linux-vdso.so.1
-	libstdc++.so.6 => /usr/lib/x86_64-linux-gnu/libstdc++.so.6
-	libgcc_s.so.1 => /usr/lib/x86_64-linux-gnu/libgcc_s.so.1
-	libc.so.6 => /usr/lib/x86_64-linux-gnu/libc.so.6
-	/lib64/ld-linux-x86-64.so.2
-
-The pthreads support is supplied by the platform toolchain and requested by
--pthread. No package manager or third-party library is required to build or
-run the artifacts.
+build/redis-client
+	linux-vdso.so.1 (0x00007ffcae7d3000)
+	libstdc++.so.6 => /usr/lib/x86_64-linux-gnu/libstdc++.so.6 (0x0000736204a00000)
+	libgcc_s.so.1 => /usr/lib/x86_64-linux-gnu/libgcc_s.so.1 (0x0000736204d49000)
+	libc.so.6 => /usr/lib/x86_64-linux-gnu/libc.so.6 (0x0000736204600000)
+	libm.so.6 => /usr/lib/x86_64-linux-gnu/libm.so.6 (0x00007362048da000)
+	/lib64/ld-linux-x86-64.so.2 (0x0000736204d84000)

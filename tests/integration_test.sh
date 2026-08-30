@@ -1,3 +1,11 @@
+#!/usr/bin/env bash
+# Black-box integration test: builds the project if needed, starts the
+# real server binary, drives it through the real client binary, and
+# checks responses. Exercises every command plus WRONGTYPE errors, TTL
+# expiry, and a concurrent-access burst (the "survives a basic ...
+# concurrent-access test" bullet under Track D).
+#
+# Usage: bash tests/integration_test.sh   (run from the repo root, or here)
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -39,6 +47,11 @@ if [ ! -x "$SERVER" ] || [ ! -x "$CLIENT" ]; then
     echo "redis-server / redis-client not found, building first (make)..."
     (cd "$ROOT_DIR" && make) || { echo "build failed"; exit 1; }
 fi
+
+# Clean up persistence files in the binary's directory
+SERVER_DIR="$(dirname "$SERVER")"
+rm -rf "$SERVER_DIR/data"
+mkdir -p "$SERVER_DIR/data"
 
 echo "Starting server..."
 "$SERVER" &
@@ -106,16 +119,20 @@ check "GET after TTL expiry"     "(nil)"    "$(run get temp)"
 check "PTTL of an expired key is -2" "(int) -2" "$(run pttl temp)"
 
 echo "-- concurrent access (Track D requirement) --"
+CLIENT_PIDS=""
 for i in $(seq 1 50); do
-    ( run sadd concurrent_set "member$i" > /dev/null ) &
+    run sadd concurrent_set "member$i" > /dev/null &
+    CLIENT_PIDS="$CLIENT_PIDS $!"
 done
-wait
+wait $CLIENT_PIDS
 check "SCARD after 50 concurrent SADDs" "(int) 50" "$(run scard concurrent_set)"
 
+CLIENT_PIDS=""
 for i in $(seq 1 50); do
-    ( run zadd concurrent_zset "$i" "member$i" > /dev/null ) &
+    run zadd concurrent_zset "$i" "member$i" > /dev/null &
+    CLIENT_PIDS="$CLIENT_PIDS $!"
 done
-wait
+wait $CLIENT_PIDS
 ZLEN_OUT="$(run zquery concurrent_zset -1000000 "" 0 1000)"
 CONCURRENT_ZCOUNT="$(echo "$ZLEN_OUT" | grep -c '(str) member')"
 check "50 concurrent ZADDs all landed" "50" "$CONCURRENT_ZCOUNT"

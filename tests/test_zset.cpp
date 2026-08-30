@@ -1,9 +1,10 @@
-// Unit tests for ZSet — the skiplist + hashmap pairing that backs sorted
-// sets, checking the two structures stay in agreement with each other.
-// Build: g++ -O2 -std=gnu++17 -Wall -Wextra -pthread -DBUILD_TEST \
-//            -o test_zset tests/test_zset.cpp
+/* Unit tests for ZSet — the skiplist + hashmap pairing that backs sorted
+ * sets, checking the two structures stay in agreement with each other.
+ * Build: g++ -O2 -std=gnu++17 -Wall -Wextra -pthread -DBUILD_TEST \
+ *            -o test_zset tests/test_zset.cpp
+ */
 #define BUILD_TEST
-#include "../src/redis.cpp"
+#include "../src/zset.hpp"
 #include "test_common.h"
 
 TEST(insert_new_member_returns_true_score_update_returns_false) {
@@ -87,13 +88,13 @@ TEST(seekge_matches_the_underlying_skiplist) {
         std::string name = "m" + std::to_string(i);
         zset_insert(&zset, name.data(), name.size(), (double)(i * 5));
     }
-    SkiplistNode *n = zset_seekge(&zset, 23.0, "");
+    SkiplistNode *n = zset_seekge(&zset, 23.0, "", 0);
     CHECK(n != NULL);
     CHECK_EQ(n->score, 25.0); // first score >= 23 is 25 (m5)
     CHECK_EQ(n->member, std::string("m5"));
 
     // past the end
-    CHECK(zset_seekge(&zset, 10000.0, "") == NULL);
+    CHECK(zset_seekge(&zset, 10000.0, "", 0) == NULL);
 
     zset_clear(&zset);
 }
@@ -101,7 +102,7 @@ TEST(seekge_matches_the_underlying_skiplist) {
 TEST(seekge_on_an_empty_zset_returns_null) {
     ZSet zset;
     zset_init(&zset);
-    CHECK(zset_seekge(&zset, 0.0, "") == NULL);
+    CHECK(zset_seekge(&zset, 0.0, "", 0) == NULL);
     zset_clear(&zset);
 }
 

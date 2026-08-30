@@ -1,9 +1,8 @@
 // Unit tests for HMap (the progressive-rehash hashtable behind the
 // keyspace and the zset member index).
-// Build: g++ -O2 -std=gnu++17 -Wall -Wextra -pthread -DBUILD_TEST \
-//            -o test_hashtable tests/test_hashtable.cpp
-#define BUILD_TEST
-#include "../src/redis.cpp"
+// Build: g++ -O2 -std=gnu++17 -Wall -Wextra -pthread \
+//            -o test_hashtable tests/test_hashtable.cpp -Isrc
+#include "../src/hmap.hpp"
 #include "test_common.h"
 
 struct StrNode {
@@ -20,14 +19,14 @@ static bool str_eq(HNode *a, HNode *b) {
 static StrNode *make_node(const std::string &key) {
     StrNode *n = new StrNode();
     n->key = key;
-    n->node.hcode = str_hash((uint8_t *)key.data(), key.size());
+    n->node.hcode = str_hash((const uint8_t *)key.data(), key.size());
     return n;
 }
 
 static HNode *lookup_key(HMap *hmap, const std::string &key) {
     StrNode probe;
     probe.key = key;
-    probe.node.hcode = str_hash((uint8_t *)key.data(), key.size());
+    probe.node.hcode = str_hash((const uint8_t *)key.data(), key.size());
     return hm_lookup(hmap, &probe.node, &str_eq);
 }
 
@@ -61,7 +60,6 @@ TEST(delete_removes_entry_and_frees_the_slot) {
     CHECK(removed == &a->node);
     CHECK_EQ(hm_size(&hmap), (size_t)0);
     CHECK(lookup_key(&hmap, "k") == NULL);
-    // deleting again finds nothing
     CHECK(hm_delete(&hmap, &a->node, &str_eq) == NULL);
 
     hm_clear(&hmap);
@@ -69,13 +67,10 @@ TEST(delete_removes_entry_and_frees_the_slot) {
 }
 
 TEST(collisions_in_the_same_bucket_are_both_findable) {
-    // Two distinct keys, forced into the same bucket by giving them the
-    // same hash code — exercises the chaining path, not just the common
-    // case where every key lands in its own slot.
     HMap hmap{};
     StrNode *a = make_node("one");
     StrNode *b = make_node("two");
-    b->node.hcode = a->node.hcode; // force a collision
+    b->node.hcode = a->node.hcode; 
     hm_insert(&hmap, &a->node);
     hm_insert(&hmap, &b->node);
 
@@ -93,7 +88,7 @@ TEST(collisions_in_the_same_bucket_are_both_findable) {
 
 TEST(incremental_rehash_preserves_every_entry_under_load) {
     HMap hmap{};
-    const int N = 5000; // well past the load-factor threshold: forces a rehash
+    const int N = 5000;
     std::vector<StrNode *> nodes;
     for (int i = 0; i < N; i++) {
         StrNode *n = make_node("key" + std::to_string(i));
@@ -102,14 +97,10 @@ TEST(incremental_rehash_preserves_every_entry_under_load) {
     }
     CHECK_EQ(hm_size(&hmap), (size_t)N);
 
-    // every key must still resolve correctly while migration is (or was)
-    // in flight -- this is the property incremental rehashing exists for
     for (int i = 0; i < N; i++) {
         CHECK(lookup_key(&hmap, "key" + std::to_string(i)) != NULL);
     }
 
-    // enough lookups (each one calls hm_help_rehashing) should have fully
-    // drained the older generation by now
     CHECK(hmap.older.tab == NULL);
 
     hm_clear(&hmap);
@@ -124,8 +115,6 @@ TEST(delete_mid_rehash_finds_entries_regardless_of_generation) {
         nodes.push_back(n);
         hm_insert(&hmap, &n->node);
     }
-    // delete half immediately -- a rehash may still be in progress, so
-    // this exercises hm_delete's fall-through from newer to older table
     int deleted = 0;
     for (int i = 0; i < 100; i++) {
         if (hm_delete(&hmap, &nodes[i]->node, &str_eq)) deleted++;
