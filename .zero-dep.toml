@@ -1,0 +1,2 @@
+track = "D"
+pitch = "A dependency-free in-memory key-value store with strings, TTLs, sorted sets, and a custom binary protocol."
