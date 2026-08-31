@@ -1,6 +1,6 @@
-// Unit tests for the skiplist that backs sorted sets.
-// Build: g++ -O2 -std=gnu++17 -Wall -Wextra -pthread -DBUILD_TEST \
-//            -o test_skiplist tests/test_skiplist.cpp
+/* Unit tests for the skiplist that backs sorted sets. */
+/* Build: g++ -O2 -std=gnu++17 -Wall -Wextra -pthread -DBUILD_TEST */
+/*            -o test_skiplist tests/test_skiplist.cpp */
 #define BUILD_TEST
 #include "../src/skiplist.hpp"
 #include "test_common.h"

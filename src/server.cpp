@@ -6,6 +6,7 @@
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <netinet/ip.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -13,6 +14,7 @@
 #include <signal.h>
 #include <time.h>
 #include <limits.h>
+#include <cstdlib>
 #include <unordered_map>
 
 static void msg_errno(const char *msg) { fprintf(stderr, "[errno:%d] %s\n", errno, msg); }
@@ -67,6 +69,51 @@ struct Conn {
     DList idle_node;
 };
 
+// ---- maxmemory / eviction ----
+enum class EvictPolicy : uint32_t {
+    NoEviction = 0,
+    AllKeysLRU = 1,
+    AllKeysLFU = 2,
+    VolatileLRU = 3,
+    VolatileLFU = 4,
+    VolatileTTL = 5,
+};
+
+static const char *evict_policy_name(EvictPolicy p) {
+    switch (p) {
+        case EvictPolicy::NoEviction: return "noeviction";
+        case EvictPolicy::AllKeysLRU: return "allkeys-lru";
+        case EvictPolicy::AllKeysLFU: return "allkeys-lfu";
+        case EvictPolicy::VolatileLRU: return "volatile-lru";
+        case EvictPolicy::VolatileLFU: return "volatile-lfu";
+        case EvictPolicy::VolatileTTL: return "volatile-ttl";
+        default: return "unknown";
+    }
+}
+
+static bool evict_policy_from_name(const std::string &s, EvictPolicy *out) {
+    static const std::unordered_map<std::string, EvictPolicy> k_map = {
+        {"noeviction", EvictPolicy::NoEviction},
+        {"allkeys-lru", EvictPolicy::AllKeysLRU},
+        {"allkeys-lfu", EvictPolicy::AllKeysLFU},
+        {"volatile-lru", EvictPolicy::VolatileLRU},
+        {"volatile-lfu", EvictPolicy::VolatileLFU},
+        {"volatile-ttl", EvictPolicy::VolatileTTL},
+    };
+    auto it = k_map.find(s);
+    if (it == k_map.end()) return false;
+    *out = it->second;
+    return true;
+}
+
+// ---- background (forked) persistence bookkeeping ----
+struct AofRewriteState {
+    bool in_progress = false;
+    pid_t pid = -1;
+    Buffer incr_buf;   // write commands accumulated while the child is rewriting
+    uint64_t incr_size = 0;
+};
+
 struct ServerState {
     HMap db;
     std::vector<Conn *> fd2conn;
@@ -91,6 +138,15 @@ struct ServerState {
     uint64_t aof_size_at_last_rewrite = 0;
     uint64_t last_aof_fsync_ms = 0;
     bool aof_dirty_since_fsync = false;
+
+    // background fork-based persistence
+    pid_t bgsave_pid = -1;
+    AofRewriteState aof_rewrite;
+
+    // maxmemory / eviction
+    uint64_t maxmemory_bytes = 0;          // 0 = disabled
+    EvictPolicy maxmemory_policy = EvictPolicy::NoEviction;
+    uint64_t evicted_keys = 0;
 } g_server;
 
 static void conn_update_epoll(Conn *conn) {
@@ -231,6 +287,10 @@ static void out_end_arr(Buffer &out, size_t ctx, uint32_t n) {
 
 enum class ObjType : uint32_t { Init = 0, Str = 1, ZSet = 2, List = 3, Hash = 4, Set = 5 };
 
+// LFU_INIT_VAL mirrors real Redis: new keys start "warm" rather than at 0,
+// so a freshly-written key isn't the very first eviction candidate.
+constexpr uint8_t k_lfu_init_val = 5;
+
 struct Entry {
     struct HNode node;
     std::string key;
@@ -242,6 +302,10 @@ struct Entry {
     std::deque<std::string> *list = nullptr;
     std::unordered_map<std::string, std::string> *hash = nullptr;
     std::unordered_map<std::string, char> *set = nullptr;
+
+    // eviction metadata: approximate LRU timestamp + Redis-style logarithmic LFU counter
+    uint64_t last_access_ms = 0;
+    uint8_t access_freq = k_lfu_init_val;
 };
 
 static const char *type_name(ObjType t) {
@@ -258,6 +322,7 @@ static const char *type_name(ObjType t) {
 static Entry *entry_new(ObjType type) {
     Entry *ent = new Entry();
     ent->type = type;
+    ent->last_access_ms = get_monotonic_msec();
     switch (type) {
         case ObjType::Str: ent->str = new std::string(); break;
         case ObjType::ZSet: ent->zset = new ZSet(); zset_init(ent->zset); break;
@@ -316,12 +381,32 @@ static bool entry_eq(HNode *node, HNode *key) {
     return ent->key == keydata->key;
 }
 
+// Redis-style logarithmic LFU counter update: the higher the counter already
+// is, the less likely a single access is to bump it further. Keeps hot keys
+// distinguishable without needing a huge integer per key.
+static uint8_t lfu_log_incr(uint8_t counter) {
+    if (counter >= 255) return 255;
+    double base_val = counter > k_lfu_init_val ? (double)(counter - k_lfu_init_val) : 0.0;
+    double p = 1.0 / (base_val * 10.0 + 1.0);
+    double r = (double)rand() / (double)RAND_MAX;
+    if (r < p) counter++;
+    return counter;
+}
+
+static void entry_touch(Entry *ent) {
+    ent->last_access_ms = get_monotonic_msec();
+    ent->access_freq = lfu_log_incr(ent->access_freq);
+}
+
 static Entry *lookup_entry(const std::string &key) {
     LookupKey lk;
     lk.key = key;
     lk.node.hcode = str_hash(reinterpret_cast<const uint8_t*>(lk.key.data()), lk.key.size());
     HNode *node = hm_lookup(&g_server.db, &lk.node, &entry_eq);
-    return node ? container_of(node, Entry, node) : nullptr;
+    if (!node) return nullptr;
+    Entry *ent = container_of(node, Entry, node);
+    entry_touch(ent);
+    return ent;
 }
 
 static Entry *get_or_create(const std::string &key, ObjType type, Buffer &out, bool *created) {
@@ -340,6 +425,93 @@ static Entry *get_or_create(const std::string &key, ObjType type, Buffer &out, b
     hm_insert(&g_server.db, &ent->node);
     *created = true;
     return ent;
+}
+
+// ---- maxmemory eviction ----
+//
+// True Redis keeps per-object metadata (idle time / LFU counter) and samples
+// a handful of random keys per eviction to approximate global LRU/LFU without
+// the cost of an exact ordering structure. We do the same thing here: walk
+// the hashtable once with reservoir sampling to grab `k` random candidates,
+// then pick the worst of the sample according to the configured policy.
+// Memory pressure itself is approximated via process RSS (see get_rss_kb()),
+// since we don't track per-key allocation sizes.
+struct EvictSampleCtx {
+    EvictPolicy policy;
+    size_t k;
+    size_t seen = 0;
+    std::vector<Entry *> reservoir;
+};
+
+static bool evict_sample_cb(HNode *node, void *arg) {
+    EvictSampleCtx *ctx = static_cast<EvictSampleCtx *>(arg);
+    Entry *ent = container_of(node, Entry, node);
+    bool volatile_only = ctx->policy == EvictPolicy::VolatileLRU ||
+                          ctx->policy == EvictPolicy::VolatileLFU ||
+                          ctx->policy == EvictPolicy::VolatileTTL;
+    if (volatile_only && ent->heap_idx == static_cast<size_t>(-1)) {
+        return true; // key has no TTL, not eligible for volatile-* policies
+    }
+    ctx->seen++;
+    if (ctx->reservoir.size() < ctx->k) {
+        ctx->reservoir.push_back(ent);
+    } else {
+        size_t j = static_cast<size_t>(rand()) % ctx->seen;
+        if (j < ctx->k) ctx->reservoir[j] = ent;
+    }
+    return true;
+}
+
+static Entry *evict_pick_candidate(EvictPolicy policy, size_t k) {
+    EvictSampleCtx ctx{policy, k, 0, {}};
+    hm_foreach(&g_server.db, &evict_sample_cb, &ctx);
+    if (ctx.reservoir.empty()) return nullptr;
+
+    Entry *worst = ctx.reservoir[0];
+    for (Entry *e : ctx.reservoir) {
+        switch (policy) {
+            case EvictPolicy::AllKeysLRU:
+            case EvictPolicy::VolatileLRU:
+                if (e->last_access_ms < worst->last_access_ms) worst = e;
+                break;
+            case EvictPolicy::AllKeysLFU:
+            case EvictPolicy::VolatileLFU:
+                if (e->access_freq < worst->access_freq) worst = e;
+                break;
+            case EvictPolicy::VolatileTTL: {
+                uint64_t e_exp = e->heap_idx != static_cast<size_t>(-1) ? g_server.heap[e->heap_idx].val : UINT64_MAX;
+                uint64_t w_exp = worst->heap_idx != static_cast<size_t>(-1) ? g_server.heap[worst->heap_idx].val : UINT64_MAX;
+                if (e_exp < w_exp) worst = e;
+                break;
+            }
+            default: break;
+        }
+    }
+    return worst;
+}
+
+static bool hnode_same(HNode *node, HNode *key) { return node == key; }
+
+// Called after writes (and periodically) so the keyspace stays under
+// maxmemory. Bounded per call so one hot write doesn't stall the loop.
+static void evict_if_needed() {
+    if (g_server.maxmemory_bytes == 0 || g_server.maxmemory_policy == EvictPolicy::NoEviction) return;
+    constexpr int k_max_evictions_per_call = 16;
+    constexpr size_t k_sample_size = 5;
+    for (int iter = 0; iter < k_max_evictions_per_call; iter++) {
+        long rss_kb = get_rss_kb();
+        if (rss_kb < 0) return;
+        uint64_t rss_bytes = static_cast<uint64_t>(rss_kb) * 1024;
+        if (rss_bytes <= g_server.maxmemory_bytes) return;
+
+        Entry *victim = evict_pick_candidate(g_server.maxmemory_policy, k_sample_size);
+        if (!victim) return; // nothing eligible to evict under the current policy
+
+        HNode *node = hm_delete(&g_server.db, &victim->node, &hnode_same);
+        if (!node) return;
+        g_server.evicted_keys++;
+        entry_del(container_of(node, Entry, node));
+    }
 }
 
 static void do_get(const std::vector<std::string> &cmd, Buffer &out) {
@@ -645,6 +817,51 @@ static void do_zquery(const std::vector<std::string> &cmd, Buffer &out) {
     out_end_arr(out, ctx, static_cast<uint32_t>(n));
 }
 
+// ---- Config (maxmemory / maxmemory-policy) ----
+static void do_config(const std::vector<std::string> &cmd, Buffer &out) {
+    if (cmd.size() < 3) return out_err(out, ErrCode::BadArg, "wrong number of arguments");
+    std::string sub = cmd[1];
+    for (char &c : sub) c = static_cast<char>(tolower(c));
+    std::string param = cmd[2];
+    for (char &c : param) c = static_cast<char>(tolower(c));
+
+    if (sub == "get") {
+        if (param == "maxmemory") {
+            size_t ctx = out_begin_arr(out);
+            out_str(out, "maxmemory", 9);
+            out_str(out, std::to_string(g_server.maxmemory_bytes));
+            out_end_arr(out, ctx, 2);
+        } else if (param == "maxmemory-policy") {
+            size_t ctx = out_begin_arr(out);
+            out_str(out, "maxmemory-policy", 16);
+            const char *name = evict_policy_name(g_server.maxmemory_policy);
+            out_str(out, name, strlen(name));
+            out_end_arr(out, ctx, 2);
+        } else {
+            return out_err(out, ErrCode::BadArg, "unknown config parameter");
+        }
+        return;
+    }
+    if (sub == "set") {
+        if (cmd.size() < 4) return out_err(out, ErrCode::BadArg, "wrong number of arguments");
+        if (param == "maxmemory") {
+            int64_t bytes = 0;
+            if (!str2int(cmd[3], bytes) || bytes < 0) return out_err(out, ErrCode::BadArg, "expect non-negative int64");
+            g_server.maxmemory_bytes = static_cast<uint64_t>(bytes);
+            return out_nil(out);
+        } else if (param == "maxmemory-policy") {
+            std::string policy_str = cmd[3];
+            for (char &c : policy_str) c = static_cast<char>(tolower(c));
+            EvictPolicy policy;
+            if (!evict_policy_from_name(policy_str, &policy)) return out_err(out, ErrCode::BadArg, "unknown eviction policy");
+            g_server.maxmemory_policy = policy;
+            return out_nil(out);
+        }
+        return out_err(out, ErrCode::BadArg, "unknown config parameter");
+    }
+    return out_err(out, ErrCode::BadArg, "unknown CONFIG subcommand");
+}
+
 // ---- Persistence ----
 std::string g_data_dir, g_rdb_path, g_rdb_tmp_path, g_aof_path, g_aof_tmp_path;
 constexpr uint32_t k_rdb_magic = 0x42445230;
@@ -745,6 +962,29 @@ static bool save_snapshot(const char *path) {
     return true;
 }
 
+// ---- Fork-based background save (CoW) ----
+//
+// fork() gives the child a page-table copy of the parent's entire address
+// space; actual pages are only duplicated (copy-on-write) if the parent
+// mutates them after the fork. That's what makes this non-blocking: the
+// child walks a private, point-in-time view of g_server.db while the parent
+// keeps handling client I/O and writes on the original pages. We flush libc
+// stdio buffers before forking so the child doesn't inherit (and possibly
+// re-flush) any buffered-but-unwritten parent output.
+static bool bg_save_snapshot() {
+    if (g_server.bgsave_pid > 0) return false; // one at a time, like real Redis
+    fflush(nullptr);
+    pid_t pid = fork();
+    if (pid < 0) { msg_errno("fork() for BGSAVE failed"); return false; }
+    if (pid == 0) {
+        // Child: CoW view of the dataset. Writes tmp file + renames into place, then exits.
+        bool ok = save_snapshot(g_rdb_path.c_str());
+        _exit(ok ? 0 : 1);
+    }
+    g_server.bgsave_pid = pid;
+    return true;
+}
+
 static bool load_entry(FILE *fp) {
     std::string key; uint32_t type = 0; int64_t ttl_ms = -1;
     if (!fread_str(fp, key) || !fread_u32(fp, type) || !fread_i64(fp, ttl_ms)) return false;
@@ -819,11 +1059,28 @@ static bool aof_write_frame(FILE *fp, const std::vector<std::string> &cmd, uint6
     return ok;
 }
 
+// Also appends the raw frame bytes to `buf` (used to mirror a write into the
+// incremental buffer while a background AOF rewrite is in flight).
+static void aof_append_frame_to_buffer(const std::vector<std::string> &cmd, Buffer &buf, uint64_t *size_out) {
+    Buffer payload; aof_encode_cmd(cmd, payload);
+    uint32_t len = static_cast<uint32_t>(payload.size());
+    buf_append(buf, reinterpret_cast<const uint8_t*>(&len), 4);
+    buf_append(buf, payload.data(), payload.size());
+    if (size_out) *size_out += 4 + payload.size();
+}
+
 static void aof_append(const std::vector<std::string> &cmd) {
-    if (!g_server.aof_fp) return;
-    aof_write_frame(g_server.aof_fp, cmd, &g_server.aof_size);
-    fflush(g_server.aof_fp);
-    g_server.aof_dirty_since_fsync = true;
+    if (g_server.aof_fp) {
+        aof_write_frame(g_server.aof_fp, cmd, &g_server.aof_size);
+        fflush(g_server.aof_fp);
+        g_server.aof_dirty_since_fsync = true;
+    }
+    // A BGREWRITEAOF child only sees the dataset as of fork() time; writes
+    // that land while it's working must be replayed onto the new file once
+    // the child finishes, or they'd be lost when we swap files.
+    if (g_server.aof_rewrite.in_progress) {
+        aof_append_frame_to_buffer(cmd, g_server.aof_rewrite.incr_buf, &g_server.aof_rewrite.incr_size);
+    }
 }
 
 struct AofRewriteCtx { FILE *fp = nullptr; uint64_t size = 0; bool ok = true; };
@@ -864,22 +1121,82 @@ static bool aof_rewrite_entry_cb(HNode *node, void *arg) {
     return ctx->ok;
 }
 
-static bool aof_rewrite() {
-    FILE *fp = fopen(g_aof_tmp_path.c_str(), "wb");
-    if (!fp) return false;
-    AofRewriteCtx ctx{fp, 0, true};
-    hm_foreach(&g_server.db, &aof_rewrite_entry_cb, &ctx);
-    bool ok = ctx.ok && (fflush(fp) == 0) && (fsync(fileno(fp)) == 0);
-    fclose(fp);
-    if (!ok) { unlink(g_aof_tmp_path.c_str()); return false; }
-    if (rename(g_aof_tmp_path.c_str(), g_aof_path.c_str()) != 0) { unlink(g_aof_tmp_path.c_str()); return false; }
-    if (g_server.aof_fp) fclose(g_server.aof_fp);
-    g_server.aof_fp = fopen(g_aof_path.c_str(), "ab");
-    if (!g_server.aof_fp) return false;
-    g_server.aof_size = ctx.size;
-    g_server.aof_size_at_last_rewrite = ctx.size;
-    g_server.aof_dirty_since_fsync = false;
+// ---- Fork-based BGREWRITEAOF (CoW) ----
+//
+// The child forks off a private view of the dataset and streams it out as a
+// fresh, compacted command log to the tmp path only -- it never touches the
+// live AOF or the parent's FILE*, since those aren't safely shared across
+// fork() once buffered I/O is involved. Meanwhile the parent keeps appending
+// every write to both the *old* live AOF (durability is never interrupted)
+// and an in-memory incremental buffer. When the child exits successfully,
+// reap_background_children() appends that buffer onto the child's tmp file,
+// renames it into place, and reopens the live handle -- mirroring how real
+// Redis merges its rewrite buffer after a successful BGREWRITEAOF.
+static bool bg_aof_rewrite() {
+    if (g_server.aof_rewrite.in_progress) return false;
+    fflush(nullptr);
+    pid_t pid = fork();
+    if (pid < 0) { msg_errno("fork() for BGREWRITEAOF failed"); return false; }
+    if (pid == 0) {
+        FILE *fp = fopen(g_aof_tmp_path.c_str(), "wb");
+        if (!fp) _exit(1);
+        AofRewriteCtx ctx{fp, 0, true};
+        hm_foreach(&g_server.db, &aof_rewrite_entry_cb, &ctx);
+        bool ok = ctx.ok && (fflush(fp) == 0) && (fsync(fileno(fp)) == 0);
+        fclose(fp);
+        _exit(ok ? 0 : 1);
+    }
+    g_server.aof_rewrite.in_progress = true;
+    g_server.aof_rewrite.pid = pid;
+    g_server.aof_rewrite.incr_buf.clear();
+    g_server.aof_rewrite.incr_size = 0;
     return true;
+}
+
+// Non-blocking reap of any finished BGSAVE / BGREWRITEAOF child. Called every
+// event-loop tick so we never accumulate zombies and finish rewrites promptly.
+static void reap_background_children() {
+    int status = 0;
+    if (g_server.bgsave_pid > 0) {
+        pid_t r = waitpid(g_server.bgsave_pid, &status, WNOHANG);
+        if (r == g_server.bgsave_pid) {
+            bool ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+            if (ok) g_server.ops_since_save = 0;
+            g_server.bgsave_pid = -1;
+        }
+    }
+    if (g_server.aof_rewrite.in_progress) {
+        pid_t r = waitpid(g_server.aof_rewrite.pid, &status, WNOHANG);
+        if (r == g_server.aof_rewrite.pid) {
+            bool ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+            if (ok) {
+                FILE *fp = fopen(g_aof_tmp_path.c_str(), "ab");
+                if (fp) {
+                    if (!g_server.aof_rewrite.incr_buf.empty()) {
+                        fwrite(g_server.aof_rewrite.incr_buf.data(), 1, g_server.aof_rewrite.incr_buf.size(), fp);
+                    }
+                    ok = (fflush(fp) == 0) && (fsync(fileno(fp)) == 0);
+                    fclose(fp);
+                } else {
+                    ok = false;
+                }
+            }
+            if (ok && rename(g_aof_tmp_path.c_str(), g_aof_path.c_str()) == 0) {
+                if (g_server.aof_fp) fclose(g_server.aof_fp);
+                g_server.aof_fp = fopen(g_aof_path.c_str(), "ab");
+                struct stat st;
+                g_server.aof_size = (g_server.aof_fp && fstat(fileno(g_server.aof_fp), &st) == 0)
+                                         ? static_cast<uint64_t>(st.st_size) : 0;
+                g_server.aof_size_at_last_rewrite = g_server.aof_size;
+                g_server.aof_dirty_since_fsync = false;
+            } else {
+                unlink(g_aof_tmp_path.c_str());
+            }
+            g_server.aof_rewrite.in_progress = false;
+            g_server.aof_rewrite.incr_buf.clear();
+            g_server.aof_rewrite.incr_size = 0;
+        }
+    }
 }
 
 static void do_request(const std::vector<std::string> &cmd, Buffer &out);
@@ -913,6 +1230,14 @@ static void do_stats(const std::vector<std::string> &, Buffer &out) {
     pair("memory_kb", rss_kb >= 0 ? rss_kb : 0);
     pair("aof_enabled", g_server.aof_fp ? 1 : 0);
     pair("aof_size_bytes", static_cast<int64_t>(g_server.aof_size));
+    pair("bgsave_in_progress", g_server.bgsave_pid > 0 ? 1 : 0);
+    pair("bgrewriteaof_in_progress", g_server.aof_rewrite.in_progress ? 1 : 0);
+    pair("maxmemory_bytes", static_cast<int64_t>(g_server.maxmemory_bytes));
+    pair("evicted_keys", static_cast<int64_t>(g_server.evicted_keys));
+    const char *policy_name = evict_policy_name(g_server.maxmemory_policy);
+    out_str(out, "maxmemory_policy", 16);
+    out_str(out, policy_name, strlen(policy_name));
+    n += 2;
     out_end_arr(out, ctx, n);
 }
 
@@ -923,13 +1248,18 @@ static void do_type(const std::vector<std::string> &cmd, Buffer &out) {
 }
 
 static void do_save(const std::vector<std::string> &, Buffer &out) {
+    // Synchronous, blocking save -- mirrors real Redis's SAVE (as opposed to BGSAVE).
     bool ok = save_snapshot(g_rdb_path.c_str());
     if (ok) g_server.ops_since_save = 0;
     return out_int(out, ok ? 1 : 0);
 }
 
+static void do_bgsave(const std::vector<std::string> &, Buffer &out) {
+    return out_int(out, bg_save_snapshot() ? 1 : 0);
+}
+
 static void do_bgrewriteaof(const std::vector<std::string> &, Buffer &out) {
-    return out_int(out, aof_rewrite() ? 1 : 0);
+    return out_int(out, bg_aof_rewrite() ? 1 : 0);
 }
 
 using CommandHandler = void (*)(const std::vector<std::string>&, Buffer&);
@@ -947,7 +1277,8 @@ static const std::unordered_map<std::string, CommandDef> k_commands = {
     {"zadd", {4, do_zadd}}, {"zrem", {3, do_zrem}}, {"zscore", {3, do_zscore}},
     {"zquery", {6, do_zquery}},
     {"stats", {1, do_stats}}, {"type", {2, do_type}}, {"save", {1, do_save}},
-    {"bgrewriteaof", {1, do_bgrewriteaof}}
+    {"bgsave", {1, do_bgsave}}, {"bgrewriteaof", {1, do_bgrewriteaof}},
+    {"config", {3, do_config}}
 };
 
 static void do_request(const std::vector<std::string> &cmd, Buffer &out) {
@@ -982,8 +1313,11 @@ static bool try_one_request(Conn *conn) {
     size_t header_pos = 0;
     response_begin(conn->outgoing, &header_pos);
     do_request(cmd, conn->outgoing);
-    if (!cmd.empty() && is_write_command(cmd[0]) && conn->outgoing[header_pos + 4] != static_cast<uint8_t>(RespTag::Err)) {
+    bool is_write = !cmd.empty() && is_write_command(cmd[0]) &&
+                     conn->outgoing[header_pos + 4] != static_cast<uint8_t>(RespTag::Err);
+    if (is_write) {
         aof_append(cmd);
+        evict_if_needed();
     }
     response_end(conn->outgoing, header_pos);
     g_server.total_cmds++; g_server.cmds_this_second++; g_server.ops_since_save++;
@@ -1030,15 +1364,16 @@ static int32_t next_timer_ms() {
     if (g_server.last_stats_ms + 1000 < next_ms) next_ms = g_server.last_stats_ms + 1000;
     if (g_server.last_save_ms + k_save_interval_ms < next_ms) next_ms = g_server.last_save_ms + k_save_interval_ms;
     if (g_server.aof_fp && g_server.last_aof_fsync_ms + k_aof_fsync_interval_ms < next_ms) next_ms = g_server.last_aof_fsync_ms + k_aof_fsync_interval_ms;
+    // While a bg child is running we still want to wake up reasonably often to reap it promptly.
+    if ((g_server.bgsave_pid > 0 || g_server.aof_rewrite.in_progress) && now_ms + 50 < next_ms) next_ms = now_ms + 50;
     if (next_ms == static_cast<uint64_t>(-1)) return -1;
     if (next_ms <= now_ms) return 0;
     return static_cast<int32_t>(next_ms - now_ms);
 }
 
-static bool hnode_same(HNode *node, HNode *key) { return node == key; }
-
 static void process_timers() {
     uint64_t now_ms = get_monotonic_msec();
+    reap_background_children();
     if (now_ms - g_server.last_stats_ms >= 1000) {
         g_server.ops_per_sec = g_server.cmds_this_second;
         g_server.cmds_this_second = 0;
@@ -1057,16 +1392,19 @@ static void process_timers() {
         if (nworks++ >= k_max_works) break;
     }
     if (now_ms - g_server.last_save_ms >= k_save_interval_ms) {
-        if (g_server.ops_since_save > 0) { if (save_snapshot(g_rdb_path.c_str())) g_server.ops_since_save = 0; }
+        // Fork-based: doesn't block the event loop while the RDB is written out.
+        if (g_server.ops_since_save > 0) bg_save_snapshot();
         g_server.last_save_ms = now_ms;
     }
     if (g_server.aof_fp && now_ms - g_server.last_aof_fsync_ms >= k_aof_fsync_interval_ms) {
         if (g_server.aof_dirty_since_fsync) { fsync(fileno(g_server.aof_fp)); g_server.aof_dirty_since_fsync = false; }
         g_server.last_aof_fsync_ms = now_ms;
         if (g_server.aof_size >= k_aof_rewrite_min_size && g_server.aof_size >= g_server.aof_size_at_last_rewrite * 2) {
-            aof_rewrite();
+            bg_aof_rewrite();
         }
     }
+    // Catches memory growth from read-heavy / non-write-triggering activity too.
+    evict_if_needed();
 }
 
 static volatile sig_atomic_t g_shutdown_requested = 0;
@@ -1081,6 +1419,7 @@ int main() {
     g_server.last_stats_ms = g_server.start_time_ms;
     g_server.last_save_ms = g_server.start_time_ms;
     g_server.last_aof_fsync_ms = g_server.start_time_ms;
+    srand(static_cast<unsigned>(g_server.start_time_ms));
 
     struct stat aof_st;
     if (stat(g_aof_path.c_str(), &aof_st) == 0 && aof_st.st_size > 0) {
@@ -1098,6 +1437,9 @@ int main() {
 
     struct sigaction sa = {}; sa.sa_handler = on_shutdown_signal;
     sigaction(SIGINT, &sa, nullptr); sigaction(SIGTERM, &sa, nullptr);
+    // Reaping is done explicitly via waitpid(WNOHANG) in reap_background_children(),
+    // so we don't need a SIGCHLD handler -- just make sure it doesn't interrupt syscalls unexpectedly.
+    signal(SIGCHLD, SIG_DFL);
 
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) die("socket()");
@@ -1120,6 +1462,8 @@ int main() {
 
     while (true) {
         if (g_shutdown_requested) {
+            // Final shutdown save stays synchronous/blocking on purpose: we're exiting anyway,
+            // and we want the data on disk before the process (and any in-flight bg child) goes away.
             save_snapshot(g_rdb_path.c_str());
             if (g_server.aof_fp) { fflush(g_server.aof_fp); fsync(fileno(g_server.aof_fp)); }
             break;
