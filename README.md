@@ -35,6 +35,106 @@ make all
 ./build/redis-server
 ```
 
+## Client Usage
+
+`build/redis-client` is a minimal CLI client that connects to `127.0.0.1:1234`, sends a single command over the custom length-prefixed binary protocol, and prints the parsed response.
+
+```text
+./build/redis-client SET foo bar
+(str) OK
+
+./build/redis-client GET foo
+(str) bar
+
+./build/redis-client GET missing
+(nil)
+
+./build/redis-client SADD myset a b c
+(int) 3
+
+./build/redis-client HGETALL nonexistent
+(arr) len=0
+(arr) end
+```
+
+**Response formatting:** the client decodes the server's tagged binary response (`Nil`, `Err`, `Str`, `Int`, `Dbl`, `Arr`) and prints it in a `redis-cli`-style format — `(nil)`, `(str) ...`, `(int) ...`, `(dbl) ...`, `(err) <code> <message>`, or `(arr) len=N` followed by each recursively-printed element and `(arr) end`.
+
+**Limits:** requests and responses are capped at `k_max_msg` (4096 bytes) per the wire protocol; oversized commands are rejected client-side before sending.
+
+## Supported Data Types & Commands
+
+### Strings
+| Command | Description |
+| :--- | :--- |
+| `GET <key>` | Retrieve a string value. Returns `(nil)` if missing, `WRONGTYPE` if the key holds another type. |
+| `SET <key> <value>` | Set a string value, creating the key if it doesn't exist. |
+
+### Lists
+Backed by `std::deque<std::string>`.
+
+| Command | Description |
+| :--- | :--- |
+| `LPUSH <key> <val> [val ...]` | Push one or more values onto the head. |
+| `RPUSH <key> <val> [val ...]` | Push one or more values onto the tail. |
+| `LPOP <key>` | Pop and return the head element, or `(nil)` if empty/missing. |
+| `RPOP <key>` | Pop and return the tail element, or `(nil)` if empty/missing. |
+| `LLEN <key>` | Return list length (`0` if missing). |
+| `LRANGE <key> <start> <stop>` | Return an inclusive range; supports negative indices (Redis-style). |
+
+### Hashes
+Backed by `std::unordered_map<std::string, std::string>`.
+
+| Command | Description |
+| :--- | :--- |
+| `HSET <key> <field> <val> [field val ...]` | Set one or more field/value pairs. Returns count of newly-added fields. |
+| `HGET <key> <field>` | Return a field's value, or `(nil)`. |
+| `HDEL <key> <field> [field ...]` | Remove one or more fields, returns count removed. |
+| `HGETALL <key>` | Return all field/value pairs as a flat array. |
+| `HLEN <key>` | Return number of fields (`0` if missing). |
+
+### Sets
+Backed by `std::unordered_map<std::string, char>`.
+
+| Command | Description |
+| :--- | :--- |
+| `SADD <key> <member> [member ...]` | Add one or more members, returns count newly added. |
+| `SREM <key> <member> [member ...]` | Remove one or more members, returns count removed. |
+| `SISMEMBER <key> <member>` | Returns `1` or `0`. |
+| `SMEMBERS <key>` | Return all members as an array. |
+| `SCARD <key>` | Return cardinality (`0` if missing). |
+
+### Sorted Sets
+Backed by a skiplist (`skiplist.hpp`) + hash map (`zset.hpp`) for O(log n) rank queries.
+
+| Command | Description |
+| :--- | :--- |
+| `ZADD <key> <score> <member>` | Add/update a member's score. Returns `1` if newly added, `0` if updated. |
+| `ZREM <key> <member>` | Remove a member, returns `1`/`0`. |
+| `ZSCORE <key> <member>` | Return a member's score as `(dbl)`, or `(nil)`. |
+| `ZQUERY <key> <score> <member> <offset> <limit>` | Seek to the first element ≥ `(score, member)`, then return up to `limit` `(member, score)` pairs starting `offset` positions in. |
+
+### Key Expiration (TTL)
+Backed by a binary min-heap with intrusive back-references.
+
+| Command | Description |
+| :--- | :--- |
+| `PEXPIRE <key> <ttl_ms>` | Set/update a TTL in milliseconds. Returns `1`/`0`. Pass a negative TTL to clear it. |
+| `PTTL <key>` | Return remaining TTL in ms, `-1` if no TTL set, `-2` if key doesn't exist. |
+
+### Introspection & Admin
+| Command | Description |
+| :--- | :--- |
+| `KEYS` | Return all keys in the keyspace. |
+| `TYPE <key>` | Return the type name (`string`, `list`, `hash`, `set`, `zset`, or `none`). |
+| `STATS` | Return server metrics: connections, ops/sec, key count, uptime, RSS, AOF/BGSAVE state, eviction stats. |
+| `SAVE` | Synchronous, blocking RDB snapshot. |
+| `BGSAVE` | Non-blocking RDB snapshot via `fork()`. |
+| `BGREWRITEAOF` | Non-blocking AOF compaction via `fork()`. |
+| `CONFIG GET <param>` | Read `maxmemory` or `maxmemory-policy`. |
+| `CONFIG SET <param> <value>` | Set `maxmemory` (bytes) or `maxmemory-policy` (`noeviction`, `allkeys-lru`, `allkeys-lfu`, `volatile-lru`, `volatile-lfu`, `volatile-ttl`). |
+
+All commands return a tagged response (`Nil`, `Str`, `Int`, `Dbl`, `Arr`, or `Err`) as described in **Client Usage** above. `WRONGTYPE`-style errors are returned when a command is run against a key of the wrong type (`ErrCode::BadType`).
+
 ## Datastore Architecture
 
 Core operations and event loops are implemented directly in the `src/` directory:
@@ -80,7 +180,6 @@ This submission targets **Track D (Data & Storage)** and passes the provided tes
 ldd build/redis-server > deps-proof.txt
 cat deps-proof.txt
 ```
-*(Expected output contains only system libraries like `linux-vdso.so`, `libpthread.so`, `libm.so`, `libstdc++.so`, `libgcc_s.so`, and `libc.so`.)*
 
 ## Bonus Claims
 
